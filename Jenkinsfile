@@ -278,7 +278,7 @@ API="https://api.github.com/repos/${REPO_SLUG}/releases"
 AUTH="Authorization: Bearer ${GH_PAT}"
 UA="User-Agent: jenkins-ci"
 
-# Tenta criar a release; se já existir, busca por tag
+# Tenta criar a release; se já existir, faz GET por tag
 CREATE_PAYLOAD=$(cat <<JSON
 {"tag_name":"${TAG}","name":"Build ${BUILD_NUMBER} (${GIT_SHORT})",
  "body":"Artefatos do Jenkins. Imagem Docker (.tar) anexada.",
@@ -287,29 +287,29 @@ JSON
 )
 
 set +e
-curl -sfSL -H "$AUTH" -H "Accept: application/vnd.github+json" -H "$UA" -X POST -d "$CREATE_PAYLOAD" "$API" > release.json
-RC=$?
+curl -sfSL -H "$AUTH" -H "Accept: application/vnd.github+json" -H "$UA" \
+     -X POST -d "$CREATE_PAYLOAD" "$API" >/dev/null
 set -e
 
-if [ $RC -ne 0 ] || ! grep -q '"upload_url"' release.json; then
-  curl -sfSL -H "$AUTH" -H "Accept: application/vnd.github+json" -H "$UA" "$API/tags/${TAG}" > release.json
-fi
+# Busca a release por tag para garantir upload_url
+curl -sfSL -H "$AUTH" -H "Accept: application/vnd.github+json" -H "$UA" \
+     "$API/tags/${TAG}" > release.json
 
-# Extrai upload_url com Python (sem sed/jq)
 UPLOAD_BASE=$(docker run --rm -v "$PWD:/w" -w /w python:3.13-slim python - <<'PY'
-import json
+import json, sys
 with open('release.json','r',encoding='utf-8') as f:
     data = json.load(f)
 upload = data.get('upload_url') or (data.get('assets_url','').replace('https://api.github.com','https://uploads.github.com'))
-print(upload.split('{')[0])
+upload = (upload or '').split('{')[0].strip()
+print(upload)
 PY
 )
 
-if [ -z "$UPLOAD_BASE" ]; then
-  echo "Falha ao obter upload_url da release:"
-  cat release.json
-  exit 1
+if [ -z "$UPLOAD_BASE" ] || ! echo "$UPLOAD_BASE" | grep -q '^https://'; then
+  echo "Falha ao obter upload_url válido."; cat release.json; exit 1
 fi
+
+echo "Upload base: $UPLOAD_BASE"
 
 upload() {
   f="$1"
@@ -325,6 +325,7 @@ upload build-info.txt
 for f in artifacts/*.tar; do upload "$f"; done
 '''
             } else {
+              // ===== WINDOWS: versão robusta com validação do upload_url =====
               powershell '''
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -349,7 +350,7 @@ $Headers = @{
   "User-Agent"  = "jenkins-ci"
 }
 
-# cria ou obtém release
+# 1) Tenta criar a release (idempotente)
 $body = @{
   tag_name   = $TAG
   name       = "Build $($Env:BUILD_NUMBER) ($($Env:GIT_SHORT))"
@@ -359,22 +360,36 @@ $body = @{
 } | ConvertTo-Json
 
 try {
-  $res = Invoke-RestMethod -Method Post -Uri $api -Headers $Headers -ContentType 'application/json' -Body $body
+  Invoke-RestMethod -Method Post -Uri $api -Headers $Headers -ContentType 'application/json' -Body $body | Out-Null
 } catch {
-  if ($_.Exception.Response.StatusCode.Value__ -eq 422) {
-    $res = Invoke-RestMethod -Method Get -Uri "$api/tags/$TAG" -Headers $Headers
+  if ($_.Exception.Response.StatusCode.Value__ -in  @([int]422,[int]409)) {
+    Write-Host "Release já existia; prosseguindo."
   } else { throw }
 }
 
-# upload_url
+# 2) Busca sempre o objeto final por TAG (garante upload_url)
+$res = Invoke-RestMethod -Method Get -Uri "$api/tags/$TAG" -Headers $Headers
+
+# 3) Resolve upload_base (upload_url sem {...} OU assets_url -> uploads.github.com)
 $uploadBase = $null
 if ($res.upload_url) {
-  $uploadBase = $res.upload_url.Split('{')[0]
+  $uploadBase = $res.upload_url.ToString().Split('{')[0]
 } elseif ($res.assets_url) {
-  $uploadBase = $res.assets_url.Replace('https://api.github.com','https://uploads.github.com')
-} else { throw "GitHub release response sem upload_url/assets_url" }
+  $uploadBase = $res.assets_url.ToString().Replace('https://api.github.com','https://uploads.github.com')
+}
 
-# lista de arquivos para enviar
+if ([string]::IsNullOrWhiteSpace($uploadBase)) {
+  throw "GitHub release response sem upload_url/assets_url"
+}
+
+$uploadBase = $uploadBase.Trim()
+$uriObj = $null
+if (-not [Uri]::TryCreate($uploadBase, [UriKind]::Absolute, [ref]$uriObj)) {
+  throw "uploadBase inválido: '$uploadBase'"
+}
+Write-Host ("Upload base: " + $uploadBase)
+
+# 4) Monta lista de arquivos existentes
 $files = New-Object System.Collections.ArrayList
 foreach ($p in @('reports/junit.xml','build-info.txt')) {
   $full = Join-Path $Env:WORKSPACE $p
@@ -383,6 +398,7 @@ foreach ($p in @('reports/junit.xml','build-info.txt')) {
 $tarFiles = Get-ChildItem -Path (Join-Path $Env:WORKSPACE 'artifacts') -Filter *.tar -ErrorAction SilentlyContinue
 if ($tarFiles) { foreach ($t in $tarFiles) { [void]$files.Add($t.FullName) } }
 
+# 5) Upload
 foreach ($f in $files) {
   $name = [IO.Path]::GetFileName($f)
   $encoded = [System.Web.HttpUtility]::UrlEncode($name)
