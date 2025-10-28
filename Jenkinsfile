@@ -126,8 +126,7 @@ trap cleanup EXIT
 
 $compose_cmd -f "$dc" -f "$ci" up -d db
 
-# Espera DB dentro da rede do compose (sem depender de wait-for-it.sh)
-# Executa no container da API (tem bash instalado) e só roda os testes quando db:5432 responder
+# Espera DB dentro da rede do compose e roda testes
 $compose_cmd -f "$dc" -f "$ci" run --rm api bash -lc 'until (</dev/tcp/db/5432) >/dev/null 2>&1; do echo "[ci] aguardando db:5432..."; sleep 0.5; done; tr -d "\\r" < scripts/run_tests.sh > /tmp/run_tests.sh && chmod +x /tmp/run_tests.sh && /tmp/run_tests.sh'
 '''
           } else {
@@ -156,7 +155,7 @@ $upArgs = @('compose','-f', $dc, '-f', $ci, 'up','-d','db')
 & docker @upArgs
 
 try {
-  # Espera db:5432 de dentro da rede e executa testes
+  # Espera db:5432 da rede e executa testes
   $cmdStr = @"
 until (</dev/tcp/db/5432) >/dev/null 2>&1; do echo '[ci] aguardando db:5432...'; sleep 0.5; done; tr -d '\r' < scripts/run_tests.sh > /tmp/run_tests.sh && chmod +x /tmp/run_tests.sh && /tmp/run_tests.sh
 "@
@@ -193,13 +192,13 @@ finally {
 set -e
 mkdir -p artifacts
 
-# Garante .dockerignore para não mandar GB de contexto
+# .dockerignore defensivo (evita contexto gigante)
 touch .dockerignore
 for p in artifacts/ reports/ .git/ .venv/ venv/ node_modules/ __pycache__/ *.tar *.zip *.log; do
   grep -qxF "$p" .dockerignore || echo "$p" >> .dockerignore
 done
 
-# Se o Dockerfile referir scripts/wait-for-it.sh, garante um stub presente
+# stub wait-for-it.sh se Dockerfile referir scripts/wait-for-it.sh
 mkdir -p scripts
 if [ ! -f scripts/wait-for-it.sh ]; then
   cat > scripts/wait-for-it.sh <<'SH'
@@ -219,23 +218,27 @@ docker image ls ${IMAGE_NAME}:${IMAGE_TAG}
 docker save -o artifacts/${IMAGE_NAME}_${IMAGE_TAG}.tar ${IMAGE_NAME}:${IMAGE_TAG}
 '''
               } else {
+                // >>>>>>> FIX: sem \Q...\E; comparação exata linha-a-linha (evita erro Groovy/regex)
                 powershell '''
 $ErrorActionPreference = "Stop"
 New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
 
-# .dockerignore defensivo (evita contexto gigante)
+# .dockerignore defensivo
 $dockerIgnore = ".dockerignore"
 if (!(Test-Path $dockerIgnore)) { New-Item -ItemType File -Path $dockerIgnore | Out-Null }
 $patterns = @(
   'artifacts/','reports/','.git/','.venv/','venv/','node_modules/','__pycache__/','*.tar','*.zip','*.log'
 )
+$existing = @()
+if (Test-Path $dockerIgnore) { $existing = Get-Content $dockerIgnore -ErrorAction SilentlyContinue }
+
 foreach ($p in $patterns) {
-  if (-not (Select-String -Path $dockerIgnore -Pattern "^\Q$p\E$" -SimpleMatch -Quiet)) {
-    Add-Content $dockerIgnore $p
-  }
+  $found = $false
+  foreach ($ln in $existing) { if ($ln.Trim() -eq $p) { $found = $true; break } }
+  if (-not $found) { Add-Content $dockerIgnore $p }
 }
 
-# Cria scripts/wait-for-it.sh se não existir (para Dockerfile que copia esse arquivo)
+# stub wait-for-it.sh se necessário
 if (!(Test-Path 'scripts')) { New-Item -ItemType Directory -Path 'scripts' | Out-Null }
 if (!(Test-Path 'scripts/wait-for-it.sh')) {
   $wfi = @"
@@ -312,11 +315,7 @@ $args = @(
   '--repo', $REPO,
   '--branch', $BRANCH
 )
-try {
-  & docker @args
-} catch {
-  Write-Warning "Falha ao enviar email (ignorado): $($_.Exception.Message)"
-}
+try { & docker @args } catch { Write-Warning "Falha ao enviar email (ignorado): $($_.Exception.Message)" }
 '''
                 }
               }
@@ -326,7 +325,7 @@ try {
       }
     }
 
-    // ===== Publicar artefatos no GitHub (Release sem depender do GHCR) =====
+    // ===== Publicar artefatos no GitHub =====
     stage('Publicar artefatos no GitHub') {
       steps {
         script { env.CI_STATUS = env.CI_STATUS ?: (currentBuild.currentResult ?: 'IN_PROGRESS') }
@@ -334,7 +333,6 @@ try {
         withCredentials([usernamePassword(credentialsId: 'github-pat', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
           script {
             if (isUnix()) {
-              // LINUX: deixa como estava (robusto). Windows já está validado abaixo.
               sh '''
 set -euo pipefail
 TAG="build-${BUILD_NUMBER}-${GIT_SHORT}"
@@ -397,7 +395,6 @@ upload_one build-info.txt
 for f in artifacts/*.tar; do upload_one "$f"; done
 '''
             } else {
-              // ===== WINDOWS: robusto com validação + URL-encode + remoção de duplicados =====
               powershell '''
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -422,7 +419,7 @@ $Headers = @{
   "User-Agent"  = "jenkins-ci"
 }
 
-# 1) Tenta criar a release (idempotente)
+# 1) Cria (ou ignora se existir)
 $body = @{
   tag_name   = $TAG
   name       = "Build $($Env:BUILD_NUMBER) ($($Env:GIT_SHORT))"
@@ -439,7 +436,7 @@ try {
   } else { throw }
 }
 
-# 2) Busca sempre por TAG
+# 2) Busca por TAG
 $res = Invoke-RestMethod -Method Get -Uri "$api/tags/$TAG" -Headers $Headers
 if (-not $res) { throw "Falha ao recuperar release por tag." }
 
@@ -455,7 +452,7 @@ $uriObj = $null
 if (-not [Uri]::TryCreate($uploadBase, [UriKind]::Absolute, [ref]$uriObj)) { throw "uploadBase inválido: '$uploadBase'" }
 Write-Host ("Upload base: " + $uploadBase)
 
-# 4) Monta lista de arquivos
+# 4) Arquivos
 $files = New-Object System.Collections.ArrayList
 foreach ($p in @('reports/junit.xml','build-info.txt')) {
   $full = Join-Path $Env:WORKSPACE $p
@@ -464,11 +461,10 @@ foreach ($p in @('reports/junit.xml','build-info.txt')) {
 $tarFiles = Get-ChildItem -Path (Join-Path $Env:WORKSPACE 'artifacts') -Filter *.tar -ErrorAction SilentlyContinue
 if ($tarFiles) { foreach ($t in $tarFiles) { [void]$files.Add($t.FullName) } }
 
-# 5) Id da release e assets
+# 5) Remoção de duplicados e upload
 $relId = $res.id
 $assetsUrl = "https://api.github.com/repos/$($Env:REPO_SLUG)/releases/$relId/assets"
 
-# 6) Upload (remove duplicado se existir)
 foreach ($f in $files) {
   $name = [IO.Path]::GetFileName($f)
   $encoded = [System.Web.HttpUtility]::UrlEncode($name)
@@ -493,7 +489,7 @@ foreach ($f in $files) {
           }
         }
 
-        // 2) Push da imagem para GHCR (Opcional)
+        // 2) Push opcional para GHCR
         script {
           if (params.PUBLISH_GHCR) {
             withCredentials([usernamePassword(credentialsId: 'ghcr-cred', usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_TOKEN')]) {
@@ -542,6 +538,7 @@ REPO="$(git config --get remote.origin.url || echo unknown)"
 BRANCH="$(git rev-parse --abbrev-ref HEAD || echo unknown)"
 RUNID="${BUILD_URL:-${JOB_NAME}#${BUILD_NUMBER}}"
 
+# Não derruba o job em rate-limit
 set +e
 docker run --rm -v "$PWD:/app" -w /app \
   -e SMTP_HOST="${SMTP_HOST}" -e SMTP_PORT="${SMTP_PORT}" \
@@ -575,11 +572,7 @@ $args = @(
   '--repo', $REPO,
   '--branch', $BRANCH
 )
-try {
-  & docker @args
-} catch {
-  Write-Warning "Falha ao enviar email (ignorado): $($_.Exception.Message)"
-}
+try { & docker @args } catch { Write-Warning "Falha ao enviar email (ignorado): $($_.Exception.Message)" }
 '''
           }
         }
