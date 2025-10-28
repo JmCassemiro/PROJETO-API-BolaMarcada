@@ -121,7 +121,7 @@ trap cleanup EXIT
 $compose_cmd -f docker-compose.yml -f docker-compose.ci.yml up -d db
 
 # Normaliza CRLF sem sed -i (evita erro de rename no FS montado)
-$compose_cmd -f docker-compose.yml -f docker-compose.ci.yml run --rm api bash -lc 'tr -d "\r" < scripts/run_tests.sh > /tmp/run_tests.sh && chmod +x /tmp/run_tests.sh && /tmp/run_tests.sh'
+$compose_cmd -f docker-compose.yml -f docker-compose.ci.yml run --rm api bash -lc 'tr -d "\\r" < scripts/run_tests.sh > /tmp/run_tests.sh && chmod +x /tmp/run_tests.sh && /tmp/run_tests.sh'
 '''
           } else {
             powershell '''
@@ -144,7 +144,7 @@ $upArgs = @('compose','-f', $dc, '-f', $ci, 'up','-d','db')
 & docker @upArgs
 
 try {
-  $cmdStr = "tr -d '\r' < scripts/run_tests.sh > /tmp/run_tests.sh && chmod +x /tmp/run_tests.sh && /tmp/run_tests.sh"
+  $cmdStr = "tr -d '`r' < scripts/run_tests.sh > /tmp/run_tests.sh && chmod +x /tmp/run_tests.sh && /tmp/run_tests.sh"
   $runArgs = @('compose','-f', $dc, '-f', $ci, 'run','--rm','api','bash','-lc', $cmdStr)
   & docker @runArgs
 }
@@ -261,6 +261,7 @@ $args = @(
         withCredentials([usernamePassword(credentialsId: 'github-pat', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
           script {
             if (isUnix()) {
+              // ===== LINUX/Mac: robusto (valida upload_url, URL-encode, remove asset duplicado) =====
               sh '''
 set -euo pipefail
 TAG="build-${BUILD_NUMBER}-${GIT_SHORT}"
@@ -274,58 +275,106 @@ TAG="build-${BUILD_NUMBER}-${GIT_SHORT}"
   echo "run=${BUILD_URL:-${JOB_NAME}#${BUILD_NUMBER}}"
 } > build-info.txt
 
-API="https://api.github.com/repos/${REPO_SLUG}/releases"
 AUTH="Authorization: Bearer ${GH_PAT}"
 UA="User-Agent: jenkins-ci"
+AC="Accept: application/vnd.github+json"
 
-# Tenta criar a release; se já existir, faz GET por tag
+API_BASE="https://api.github.com/repos/${REPO_SLUG}/releases"
+
+# 1) Tenta criar a release (idempotente)
 CREATE_PAYLOAD=$(cat <<JSON
 {"tag_name":"${TAG}","name":"Build ${BUILD_NUMBER} (${GIT_SHORT})",
  "body":"Artefatos do Jenkins. Imagem Docker (.tar) anexada.",
  "draft":false,"prerelease":false}
 JSON
 )
-
 set +e
-curl -sfSL -H "$AUTH" -H "Accept: application/vnd.github+json" -H "$UA" \
-     -X POST -d "$CREATE_PAYLOAD" "$API" >/dev/null
+curl -sfSL -H "$AUTH" -H "$AC" -H "$UA" -X POST -d "$CREATE_PAYLOAD" "$API_BASE" >/dev/null
 set -e
 
-# Busca a release por tag para garantir upload_url
-curl -sfSL -H "$AUTH" -H "Accept: application/vnd.github+json" -H "$UA" \
-     "$API/tags/${TAG}" > release.json
+# 2) Busca release por TAG (garante objeto final)
+curl -sfSL -H "$AUTH" -H "$AC" -H "$UA" "$API_BASE/tags/${TAG}" > release.json
 
+# 3) Extrai release_id e upload_base (remove {..}, troca host para uploads.github.com e remove CR)
+REL_ID=$(docker run --rm -v "$PWD:/w" -w /w python:3.13-slim python - <<'PY'
+import json,sys
+with open('release.json','r',encoding='utf-8') as f: j=json.load(f)
+print(j.get('id',''))
+PY
+)
 UPLOAD_BASE=$(docker run --rm -v "$PWD:/w" -w /w python:3.13-slim python - <<'PY'
-import json, sys
-with open('release.json','r',encoding='utf-8') as f:
-    data = json.load(f)
-upload = data.get('upload_url') or (data.get('assets_url','').replace('https://api.github.com','https://uploads.github.com'))
-upload = (upload or '').split('{')[0].strip()
-print(upload)
+import json,sys
+with open('release.json','r',encoding='utf-8') as f: j=json.load(f)
+u = (j.get('upload_url') or '').split('{')[0].strip()
+if not u:
+    a = (j.get('assets_url') or '').strip()
+    if a.startswith('https://api.github.com'):
+        u = a.replace('https://api.github.com','https://uploads.github.com')
+print(u)
 PY
 )
 
-if [ -z "$UPLOAD_BASE" ] || ! echo "$UPLOAD_BASE" | grep -q '^https://'; then
-  echo "Falha ao obter upload_url válido."; cat release.json; exit 1
+if [ -z "$REL_ID" ] || [ -z "$UPLOAD_BASE" ]; then
+  echo "Falha ao obter release_id ou upload_url válido."; cat release.json; exit 1
 fi
-
+case "$UPLOAD_BASE" in
+  https://uploads.github.com/*) ;;
+  *) echo "upload_base inválido: $UPLOAD_BASE"; exit 1 ;;
+esac
 echo "Upload base: $UPLOAD_BASE"
 
-upload() {
+# helpers
+urlencode() {
+  local LC_ALL=C s="${1-}" out="" c
+  for ((i=0; i<${#s}; i++)); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9._~-]) out+="$c" ;;
+      ' ') out+='%20' ;;
+      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+upload_one() {
   f="$1"
   [ -e "$f" ] || { echo "WARN: arquivo ausente: $f"; return 0; }
-  name=$(basename "$f")
-  curl -sfSL -H "$AUTH" -H "$UA" -H "Content-Type: application/octet-stream" \
-    --data-binary @"$f" "${UPLOAD_BASE}?name=${name}" >/dev/null
+  name="$(basename "$f")"
+  enc="$(urlencode "$name")"
+
+  # 4) Remove asset existente com o mesmo nome (idempotente)
+  curl -sfSL -H "$AUTH" -H "$AC" -H "$UA" \
+    "https://api.github.com/repos/${REPO_SLUG}/releases/${REL_ID}/assets" > assets.json
+  ASSET_ID=$(docker run --rm -v "$PWD:/w" -w /w python:3.13-slim python - <<'PY'
+import json,sys,os
+with open('assets.json','r',encoding='utf-8') as f: arr=json.load(f)
+target=os.environ.get('TARGET','')
+for a in arr:
+    if a.get('name')==target:
+        print(a.get('id') or '')
+        break
+PY
+  TARGET="$name"
+)
+  if [ -n "${ASSET_ID:-}" ]; then
+    echo "Removendo asset existente '${name}' (id=${ASSET_ID})..."
+    curl -sfSL -X DELETE -H "$AUTH" -H "$AC" -H "$UA" \
+      "https://api.github.com/repos/${REPO_SLUG}/releases/assets/${ASSET_ID}" >/dev/null
+  fi
+
+  # 5) Upload
+  curl -sfSL -X POST -H "$AUTH" -H "Content-Type: application/octet-stream" -H "$UA" \
+    --data-binary @"$f" "${UPLOAD_BASE}?name=${enc}" >/dev/null
   echo "Enviado: $name"
 }
 
-upload reports/junit.xml
-upload build-info.txt
-for f in artifacts/*.tar; do upload "$f"; done
+upload_one reports/junit.xml
+upload_one build-info.txt
+for f in artifacts/*.tar; do upload_one "$f"; done
 '''
             } else {
-              // ===== WINDOWS: versão robusta com validação do upload_url =====
+              // ===== WINDOWS: versão robusta (valida URL, URL-encode, remove asset duplicado) =====
               powershell '''
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -362,34 +411,28 @@ $body = @{
 try {
   Invoke-RestMethod -Method Post -Uri $api -Headers $Headers -ContentType 'application/json' -Body $body | Out-Null
 } catch {
-  if ($_.Exception.Response.StatusCode.Value__ -in  @([int]422,[int]409)) {
+  if ($_.Exception.Response -and ($_.Exception.Response.StatusCode.Value__ -in  @([int]422,[int]409))) {
     Write-Host "Release já existia; prosseguindo."
   } else { throw }
 }
 
-# 2) Busca sempre o objeto final por TAG (garante upload_url)
+# 2) Busca sempre por TAG
 $res = Invoke-RestMethod -Method Get -Uri "$api/tags/$TAG" -Headers $Headers
+if (-not $res) { throw "Falha ao recuperar release por tag." }
 
-# 3) Resolve upload_base (upload_url sem {...} OU assets_url -> uploads.github.com)
+# 3) upload_base
 $uploadBase = $null
 if ($res.upload_url) {
-  $uploadBase = $res.upload_url.ToString().Split('{')[0]
+  $uploadBase = $res.upload_url.ToString().Split('{')[0].Trim()
 } elseif ($res.assets_url) {
-  $uploadBase = $res.assets_url.ToString().Replace('https://api.github.com','https://uploads.github.com')
+  $uploadBase = $res.assets_url.ToString().Replace('https://api.github.com','https://uploads.github.com').Trim()
 }
-
-if ([string]::IsNullOrWhiteSpace($uploadBase)) {
-  throw "GitHub release response sem upload_url/assets_url"
-}
-
-$uploadBase = $uploadBase.Trim()
+if ([string]::IsNullOrWhiteSpace($uploadBase)) { throw "GitHub release sem upload_url/assets_url" }
 $uriObj = $null
-if (-not [Uri]::TryCreate($uploadBase, [UriKind]::Absolute, [ref]$uriObj)) {
-  throw "uploadBase inválido: '$uploadBase'"
-}
+if (-not [Uri]::TryCreate($uploadBase, [UriKind]::Absolute, [ref]$uriObj)) { throw "uploadBase inválido: '$uploadBase'" }
 Write-Host ("Upload base: " + $uploadBase)
 
-# 4) Monta lista de arquivos existentes
+# 4) Monta lista de arquivos
 $files = New-Object System.Collections.ArrayList
 foreach ($p in @('reports/junit.xml','build-info.txt')) {
   $full = Join-Path $Env:WORKSPACE $p
@@ -398,10 +441,26 @@ foreach ($p in @('reports/junit.xml','build-info.txt')) {
 $tarFiles = Get-ChildItem -Path (Join-Path $Env:WORKSPACE 'artifacts') -Filter *.tar -ErrorAction SilentlyContinue
 if ($tarFiles) { foreach ($t in $tarFiles) { [void]$files.Add($t.FullName) } }
 
-# 5) Upload
+# 5) Id da release e assets
+$relId = $res.id
+$assetsUrl = "https://api.github.com/repos/$($Env:REPO_SLUG)/releases/$relId/assets"
+
+# 6) Upload com remoção prévia se houver duplicado
 foreach ($f in $files) {
   $name = [IO.Path]::GetFileName($f)
   $encoded = [System.Web.HttpUtility]::UrlEncode($name)
+
+  try {
+    $assets = Invoke-RestMethod -Method Get -Uri $assetsUrl -Headers $Headers
+    $match = $assets | Where-Object { $_.name -eq $name }
+    if ($match) {
+      Write-Host "Removendo asset existente '$name' (id=$($match.id))..."
+      Invoke-RestMethod -Method Delete -Uri ("https://api.github.com/repos/$($Env:REPO_SLUG)/releases/assets/{0}" -f $match.id) -Headers $Headers | Out-Null
+    }
+  } catch {
+    Write-Warning "Falha ao listar/remover asset antigo: $($_.Exception.Message)"
+  }
+
   $uri = "$uploadBase?name=$encoded"
   Invoke-RestMethod -Method Post -Uri $uri -Headers @{ Authorization = $Headers.Authorization; "Content-Type" = "application/octet-stream"; "User-Agent" = "jenkins-ci" } -InFile $f | Out-Null
   Write-Host "Enviado: $name"
