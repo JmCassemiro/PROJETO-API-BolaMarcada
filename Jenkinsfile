@@ -182,6 +182,7 @@ finally {
       }
     }
 
+    // ===== Stage paralelo restaurado =====
     stage('Paralelo: Empacotamento + Notificação') {
       parallel {
         stage('Empacotamento (Docker)') {
@@ -218,12 +219,11 @@ docker image ls ${IMAGE_NAME}:${IMAGE_TAG}
 docker save -o artifacts/${IMAGE_NAME}_${IMAGE_TAG}.tar ${IMAGE_NAME}:${IMAGE_TAG}
 '''
               } else {
-                // >>>>>>> FIX: sem \Q...\E; comparação exata linha-a-linha (evita erro Groovy/regex)
                 powershell '''
 $ErrorActionPreference = "Stop"
 New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
 
-# .dockerignore defensivo
+# .dockerignore defensivo (adição linha-a-linha, sem regex)
 $dockerIgnore = ".dockerignore"
 if (!(Test-Path $dockerIgnore)) { New-Item -ItemType File -Path $dockerIgnore | Out-Null }
 $patterns = @(
@@ -262,7 +262,11 @@ docker save -o "$archive" "$tag"
 '''
               }
             }
-            archiveArtifacts artifacts: 'artifacts/*.tar', onlyIfSuccessful: true
+          }
+          post {
+            success {
+              archiveArtifacts artifacts: 'artifacts/*.tar', onlyIfSuccessful: true
+            }
           }
         }
 
@@ -290,7 +294,7 @@ docker run --rm -v "$PWD:/app" -w /app \
     --status "$STATUS" --run-id "$RUNID" --repo "$REPO" --branch "$BRANCH"
 RET=$?
 set -e
-[ $RET -eq 0 ] || echo "[warn] Notificação falhou (ignorado)."
+[ $RET -eq 0 ] || echo "[warn] Notificação (paralela) falhou (ignorado)."
 '''
                 } else {
                   powershell '''
@@ -315,7 +319,7 @@ $args = @(
   '--repo', $REPO,
   '--branch', $BRANCH
 )
-try { & docker @args } catch { Write-Warning "Falha ao enviar email (ignorado): $($_.Exception.Message)" }
+try { & docker @args } catch { Write-Warning "Falha ao enviar email (paralelo, ignorado): $($_.Exception.Message)" }
 '''
                 }
               }
@@ -489,7 +493,7 @@ foreach ($f in $files) {
           }
         }
 
-        // 2) Push opcional para GHCR
+        // 2) Push opcional para GHCR (aqui dentro de 'steps' para manter declarative válido)
         script {
           if (params.PUBLISH_GHCR) {
             withCredentials([usernamePassword(credentialsId: 'ghcr-cred', usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_TOKEN')]) {
@@ -525,6 +529,7 @@ docker push $TARGET
     always {
       script { env.CI_STATUS = currentBuild.currentResult ?: 'UNKNOWN' }
 
+      // ===== Notificação por e-mail final (pós-build) =====
       withCredentials([
         usernamePassword(credentialsId: 'mailtrap-smtp', usernameVariable: 'SMTP_USER', passwordVariable: 'SMTP_PASS'),
         string(credentialsId: 'EMAIL_TO', variable: 'EMAIL_TO')
@@ -578,6 +583,7 @@ try { & docker @args } catch { Write-Warning "Falha ao enviar email (ignorado): 
         }
       }
 
+      // Limpeza
       script {
         if (isUnix()) {
           sh 'docker system prune -f || true'
