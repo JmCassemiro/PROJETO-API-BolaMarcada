@@ -126,7 +126,7 @@ $compose_cmd -f docker-compose.yml -f docker-compose.ci.yml run --rm api bash -l
           } else {
             powershell '''
 $ErrorActionPreference = "Stop"
-New-Item -ItemType Directory -Force -Path "reports" | Out-Null
+New-Item -ItemType Directory -Force -Path "reports"   | Out-Null
 New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
 $Env:COMPOSE_PROJECT_NAME = "fastapi-ci-$Env:BUILD_NUMBER"
 
@@ -254,7 +254,7 @@ $args = @(
       }
     }
 
-    // ===== NOVO: Publicar artefatos no GitHub (Release sem depender do GHCR) =====
+    // ===== Publicar artefatos no GitHub (Release sem depender do GHCR) =====
     stage('Publicar artefatos no GitHub') {
       steps {
         script { env.CI_STATUS = env.CI_STATUS ?: (currentBuild.currentResult ?: 'IN_PROGRESS') }
@@ -299,7 +299,8 @@ if [ $RC -ne 0 ] || [ "$(printf '%s' "$RES" | tr -d '\\n' | grep -c '"upload_url
     "$API/tags/${TAG}")
 fi
 
-UPLOAD_BASE=$(printf '%s' "$RES" | sed -n 's/.*"upload_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed 's/{.*}//')
+# <<< FIX: usar ERE no sed (evita \(\))
+UPLOAD_BASE=$(printf '%s' "$RES" | sed -E -n 's/.*"upload_url"[[:space:]]*:[[:space:]]*"([^"]*)".*/\\1/p' | sed 's/{.*}//')
 if [ -z "$UPLOAD_BASE" ]; then
   echo "Falha ao obter upload_url da release:"
   echo "$RES"
@@ -331,7 +332,7 @@ $api   = "https://api.github.com/repos/$($Env:REPO_SLUG)/releases"
 
 # build-info.txt
 $lines = @(
-  "status=$($Env:CI_STATUS)",
+  "status=$($Env:CI_STATUS))",
   "image=$($Env:IMAGE_NAME):$($Env:IMAGE_TAG)",
   "repo=$($Env:REPO_SLUG)",
   "commit=$($Env:GIT_SHORT)",
@@ -392,10 +393,9 @@ foreach ($f in $files) {
         }
 
         // 2) Push da imagem para GHCR (Opcional)
-        withCredentials([usernamePassword(credentialsId: 'ghcr-cred', usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_TOKEN')]) {
-          when { expression { return params.PUBLISH_GHCR } }
-          steps {
-            script {
+        script {
+          if (params.PUBLISH_GHCR) {
+            withCredentials([usernamePassword(credentialsId: 'ghcr-cred', usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_TOKEN')]) {
               if (isUnix()) {
                 sh '''
 set -e
@@ -408,7 +408,7 @@ docker push "$TARGET"
               } else {
                 powershell '''
 $ErrorActionPreference = "Stop"
-$OWNER = $Env:REPO_SLUG.Split('/')[0]
+$OWNER  = $Env:REPO_SLUG.Split('/')[0]
 $TARGET = "ghcr.io/$OWNER/ci-api:$($Env:IMAGE_TAG)"
 $Env:GHCR_TOKEN | docker login ghcr.io -u $Env:GHCR_USER --password-stdin | Out-Null
 docker tag "$(($Env:IMAGE_NAME)):$(($Env:IMAGE_TAG))" $TARGET
@@ -416,6 +416,8 @@ docker push $TARGET
 '''
               }
             }
+          } else {
+            echo 'PUBLISH_GHCR=false — ignorando push para GHCR.'
           }
         }
       }
