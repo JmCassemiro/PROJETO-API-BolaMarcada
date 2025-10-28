@@ -2,6 +2,12 @@ services:
   db:
     # no CI não expõe porta no host
     ports: []
+    # healthcheck pra habilitar depends_on: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -h 127.0.0.1 -p 5432"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   api:
     # não leia .env no CI
@@ -14,8 +20,11 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+    depends_on:
+      db:
+        condition: service_healthy
     # roda migração + testes e gera junit
-    command: ["/wait-for-it.sh","db:5432","--","sh","-lc","alembic upgrade head && pytest -q --junitxml=reports/junit.xml"]
+    command: ["/wait-for-it.sh","db:5432","--","sh","-c","alembic upgrade head && pytest -q --junitxml=reports/junit.xml"]
     # não precisa expor 8000 no CI
     ports: []
     # garante que o junit sobreviva ao down

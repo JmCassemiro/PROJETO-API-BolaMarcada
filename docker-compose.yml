@@ -7,22 +7,33 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+    # Deixa a porta do host parametrizável p/ evitar conflito (default 5433)
     ports:
-      - "5433:5432"
+      - "${PGHOST_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB} -h 127.0.0.1 -p 5432"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     platform: linux/amd64
     restart: always
     env_file:
       - .env
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+    # mantém o wait-for-it, mas agora o db também tem healthcheck
     command: ["/wait-for-it.sh", "db:5432", "--", "sh", "-c", "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000"]
     ports:
       - "8000:8000"
+    # para DEV é útil; no CI costuma-se desativar com override
     volumes:
       - .:/app
 

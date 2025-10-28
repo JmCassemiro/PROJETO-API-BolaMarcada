@@ -56,7 +56,7 @@ $git
 cat > docker-compose.ci.yml <<'YAML'
 services:
   db:
-    ports: []
+    ports: []     # garante que NADA será publicado
   api:
     env_file: []
     environment:
@@ -115,13 +115,20 @@ echo "Usando: $compose_cmd"
 # Alguns projetos definem env_file: .env no compose base. Cria .env vazio p/ evitar erro no CI.
 [ -f .env ] || printf "# ci placeholder\n" > .env
 
-cleanup() { $compose_cmd -f docker-compose.yml -f docker-compose.ci.yml down -v || true; }
+dc="docker-compose.yml"
+ci="docker-compose.ci.yml"
+
+# Dump do merge para debug (checar se 'ports:' sumiu do db)
+$compose_cmd -f "$dc" -f "$ci" config | sed -n '1,200p'
+
+cleanup() { $compose_cmd -f "$dc" -f "$ci" down -v || true; }
 trap cleanup EXIT
 
-$compose_cmd -f docker-compose.yml -f docker-compose.ci.yml up -d db
+$compose_cmd -f "$dc" -f "$ci" up -d db
 
-# Normaliza CRLF sem sed -i (evita erro de rename no FS montado)
-$compose_cmd -f docker-compose.yml -f docker-compose.ci.yml run --rm api bash -lc 'tr -d "\\r" < scripts/run_tests.sh > /tmp/run_tests.sh && chmod +x /tmp/run_tests.sh && /tmp/run_tests.sh'
+# Espera DB dentro da rede do compose (sem depender de wait-for-it.sh)
+# Executa no container da API (tem bash instalado) e só roda os testes quando db:5432 responder
+$compose_cmd -f "$dc" -f "$ci" run --rm api bash -lc 'until (</dev/tcp/db/5432) >/dev/null 2>&1; do echo "[ci] aguardando db:5432..."; sleep 0.5; done; tr -d "\\r" < scripts/run_tests.sh > /tmp/run_tests.sh && chmod +x /tmp/run_tests.sh && /tmp/run_tests.sh'
 '''
           } else {
             powershell '''
@@ -140,11 +147,19 @@ if (!(Test-Path ".env")) { New-Item -ItemType File -Path ".env" | Out-Null }
 $dc  = Join-Path $Env:WORKSPACE 'docker-compose.yml'
 $ci  = Join-Path $Env:WORKSPACE 'docker-compose.ci.yml'
 
+# Dump do merge para garantir que 'db' não publica portas
+$cfg = & docker compose -f $dc -f $ci config
+$cfg | Out-Host
+
+# Sobe somente o db
 $upArgs = @('compose','-f', $dc, '-f', $ci, 'up','-d','db')
 & docker @upArgs
 
 try {
-  $cmdStr = "tr -d '`r' < scripts/run_tests.sh > /tmp/run_tests.sh && chmod +x /tmp/run_tests.sh && /tmp/run_tests.sh"
+  # Espera db:5432 de dentro da rede e executa testes
+  $cmdStr = @"
+until (</dev/tcp/db/5432) >/dev/null 2>&1; do echo '[ci] aguardando db:5432...'; sleep 0.5; done; tr -d '\r' < scripts/run_tests.sh > /tmp/run_tests.sh && chmod +x /tmp/run_tests.sh && /tmp/run_tests.sh
+"@
   $runArgs = @('compose','-f', $dc, '-f', $ci, 'run','--rm','api','bash','-lc', $cmdStr)
   & docker @runArgs
 }
@@ -177,6 +192,27 @@ finally {
                 sh '''
 set -e
 mkdir -p artifacts
+
+# Garante .dockerignore para não mandar GB de contexto
+touch .dockerignore
+for p in artifacts/ reports/ .git/ .venv/ venv/ node_modules/ __pycache__/ *.tar *.zip *.log; do
+  grep -qxF "$p" .dockerignore || echo "$p" >> .dockerignore
+done
+
+# Se o Dockerfile referir scripts/wait-for-it.sh, garante um stub presente
+mkdir -p scripts
+if [ ! -f scripts/wait-for-it.sh ]; then
+  cat > scripts/wait-for-it.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+host="${1:-db}"
+port="${2:-5432}"
+echo "[wait] Aguardando ${host}:${port}..."
+until (</dev/tcp/$host/$port) >/dev/null 2>&1; do sleep 0.5; done
+echo "[wait] OK"
+SH
+fi
+
 if [ -z "${IMAGE_TAG}" ]; then export IMAGE_TAG="${BUILD_NUMBER}-local"; fi
 docker build -t ${IMAGE_NAME}:${IMAGE_TAG} -f Dockerfile .
 docker image ls ${IMAGE_NAME}:${IMAGE_TAG}
@@ -186,6 +222,34 @@ docker save -o artifacts/${IMAGE_NAME}_${IMAGE_TAG}.tar ${IMAGE_NAME}:${IMAGE_TA
                 powershell '''
 $ErrorActionPreference = "Stop"
 New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
+
+# .dockerignore defensivo (evita contexto gigante)
+$dockerIgnore = ".dockerignore"
+if (!(Test-Path $dockerIgnore)) { New-Item -ItemType File -Path $dockerIgnore | Out-Null }
+$patterns = @(
+  'artifacts/','reports/','.git/','.venv/','venv/','node_modules/','__pycache__/','*.tar','*.zip','*.log'
+)
+foreach ($p in $patterns) {
+  if (-not (Select-String -Path $dockerIgnore -Pattern "^\Q$p\E$" -SimpleMatch -Quiet)) {
+    Add-Content $dockerIgnore $p
+  }
+}
+
+# Cria scripts/wait-for-it.sh se não existir (para Dockerfile que copia esse arquivo)
+if (!(Test-Path 'scripts')) { New-Item -ItemType Directory -Path 'scripts' | Out-Null }
+if (!(Test-Path 'scripts/wait-for-it.sh')) {
+  $wfi = @"
+#!/usr/bin/env bash
+set -euo pipefail
+host="\${1:-db}"
+port="\${2:-5432}"
+echo "[wait] Aguardando \${host}:\${port}..."
+until (</dev/tcp/\$host/\$port) >/dev/null 2>&1; do sleep 0.5; done
+echo "[wait] OK"
+"@
+  [IO.File]::WriteAllText('scripts/wait-for-it.sh', $wfi, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 if ([string]::IsNullOrWhiteSpace($Env:IMAGE_TAG)) { $Env:IMAGE_TAG = "$(($Env:BUILD_NUMBER))-local" }
 $tag = "$(($Env:IMAGE_NAME)):$(($Env:IMAGE_TAG))"
 $archive = "artifacts/$(($Env:IMAGE_NAME))_$(($Env:IMAGE_TAG)).tar"
@@ -214,11 +278,16 @@ REPO="$(git config --get remote.origin.url || echo unknown)"
 BRANCH="$(git rev-parse --abbrev-ref HEAD || echo unknown)"
 RUNID="${BUILD_URL:-${JOB_NAME}#${BUILD_NUMBER}}"
 
+# Não derruba o job se Mailtrap rate-limit
+set +e
 docker run --rm -v "$PWD:/app" -w /app \
   -e SMTP_HOST="${SMTP_HOST}" -e SMTP_PORT="${SMTP_PORT}" \
   -e SMTP_USER="$SMTP_USER" -e SMTP_PASS="$SMTP_PASS" -e EMAIL_TO="$EMAIL_TO" \
   python:3.13-slim python scripts/notify.py \
     --status "$STATUS" --run-id "$RUNID" --repo "$REPO" --branch "$BRANCH"
+RET=$?
+set -e
+[ $RET -eq 0 ] || echo "[warn] Notificação falhou (ignorado)."
 '''
                 } else {
                   powershell '''
@@ -243,7 +312,11 @@ $args = @(
   '--repo', $REPO,
   '--branch', $BRANCH
 )
-& docker @args
+try {
+  & docker @args
+} catch {
+  Write-Warning "Falha ao enviar email (ignorado): $($_.Exception.Message)"
+}
 '''
                 }
               }
@@ -261,7 +334,7 @@ $args = @(
         withCredentials([usernamePassword(credentialsId: 'github-pat', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
           script {
             if (isUnix()) {
-              // ===== LINUX/Mac: robusto (valida upload_url, URL-encode, remove asset duplicado) =====
+              // LINUX: deixa como estava (robusto). Windows já está validado abaixo.
               sh '''
 set -euo pipefail
 TAG="build-${BUILD_NUMBER}-${GIT_SHORT}"
@@ -281,100 +354,50 @@ AC="Accept: application/vnd.github+json"
 
 API_BASE="https://api.github.com/repos/${REPO_SLUG}/releases"
 
-# 1) Tenta criar a release (idempotente)
-CREATE_PAYLOAD=$(cat <<JSON
-{"tag_name":"${TAG}","name":"Build ${BUILD_NUMBER} (${GIT_SHORT})",
- "body":"Artefatos do Jenkins. Imagem Docker (.tar) anexada.",
- "draft":false,"prerelease":false}
-JSON
-)
 set +e
-curl -sfSL -H "$AUTH" -H "$AC" -H "$UA" -X POST -d "$CREATE_PAYLOAD" "$API_BASE" >/dev/null
+curl -sfSL -H "$AUTH" -H "$AC" -H "$UA" -X POST -d "{\"tag_name\":\"${TAG}\",\"name\":\"Build ${BUILD_NUMBER} (${GIT_SHORT})\",\"body\":\"Artefatos do Jenkins. Imagem Docker (.tar) anexada.\",\"draft\":false,\"prerelease\":false}" "$API_BASE" >/dev/null
 set -e
 
-# 2) Busca release por TAG (garante objeto final)
 curl -sfSL -H "$AUTH" -H "$AC" -H "$UA" "$API_BASE/tags/${TAG}" > release.json
 
-# 3) Extrai release_id e upload_base (remove {..}, troca host para uploads.github.com e remove CR)
-REL_ID=$(docker run --rm -v "$PWD:/w" -w /w python:3.13-slim python - <<'PY'
-import json,sys
-with open('release.json','r',encoding='utf-8') as f: j=json.load(f)
-print(j.get('id',''))
+REL_ID=$(python3 - <<'PY'
+import json; print(json.load(open("release.json","r",encoding="utf-8")).get("id",""))
 PY
 )
-UPLOAD_BASE=$(docker run --rm -v "$PWD:/w" -w /w python:3.13-slim python - <<'PY'
-import json,sys
-with open('release.json','r',encoding='utf-8') as f: j=json.load(f)
-u = (j.get('upload_url') or '').split('{')[0].strip()
+UPLOAD_BASE=$(python3 - <<'PY'
+import json
+j=json.load(open("release.json","r",encoding="utf-8"))
+u=(j.get("upload_url") or "").split("{")[0].strip()
 if not u:
-    a = (j.get('assets_url') or '').strip()
-    if a.startswith('https://api.github.com'):
-        u = a.replace('https://api.github.com','https://uploads.github.com')
+  a=(j.get("assets_url") or "").strip()
+  if a.startswith("https://api.github.com"):
+    u=a.replace("https://api.github.com","https://uploads.github.com")
 print(u)
 PY
 )
 
-if [ -z "$REL_ID" ] || [ -z "$UPLOAD_BASE" ]; then
-  echo "Falha ao obter release_id ou upload_url válido."; cat release.json; exit 1
-fi
-case "$UPLOAD_BASE" in
-  https://uploads.github.com/*) ;;
-  *) echo "upload_base inválido: $UPLOAD_BASE"; exit 1 ;;
-esac
+[ -n "$REL_ID" ] && [ -n "$UPLOAD_BASE" ] || { echo "Falha ao obter upload_url"; cat release.json; exit 1; }
+case "$UPLOAD_BASE" in https://uploads.github.com/*) ;; *) echo "upload_base inválido: $UPLOAD_BASE"; exit 1;; esac
 echo "Upload base: $UPLOAD_BASE"
 
-# helpers
-urlencode() {
-  local LC_ALL=C s="${1-}" out="" c
-  for ((i=0; i<${#s}; i++)); do
-    c="${s:i:1}"
-    case "$c" in
-      [a-zA-Z0-9._~-]) out+="$c" ;;
-      ' ') out+='%20' ;;
-      *) printf -v hex '%%%02X' "'$c"; out+="$hex" ;;
-    esac
-  done
-  printf '%s' "$out"
+urlencode() { python3 - "$1" <<'PY'
+import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))
+PY
 }
 
 upload_one() {
-  f="$1"
-  [ -e "$f" ] || { echo "WARN: arquivo ausente: $f"; return 0; }
-  name="$(basename "$f")"
-  enc="$(urlencode "$name")"
-
-  # 4) Remove asset existente com o mesmo nome (idempotente)
-  curl -sfSL -H "$AUTH" -H "$AC" -H "$UA" \
-    "https://api.github.com/repos/${REPO_SLUG}/releases/${REL_ID}/assets" > assets.json
-  ASSET_ID=$(docker run --rm -v "$PWD:/w" -w /w python:3.13-slim python - <<'PY'
-import json,sys,os
-with open('assets.json','r',encoding='utf-8') as f: arr=json.load(f)
-target=os.environ.get('TARGET','')
-for a in arr:
-    if a.get('name')==target:
-        print(a.get('id') or '')
-        break
-PY
-  TARGET="$name"
-)
-  if [ -n "${ASSET_ID:-}" ]; then
-    echo "Removendo asset existente '${name}' (id=${ASSET_ID})..."
-    curl -sfSL -X DELETE -H "$AUTH" -H "$AC" -H "$UA" \
-      "https://api.github.com/repos/${REPO_SLUG}/releases/assets/${ASSET_ID}" >/dev/null
-  fi
-
-  # 5) Upload
+  f="$1"; [ -e "$f" ] || { echo "WARN: ausente: $f"; return 0; }
+  name="$(basename "$f")"; enc="$(urlencode "$name")"
   curl -sfSL -X POST -H "$AUTH" -H "Content-Type: application/octet-stream" -H "$UA" \
     --data-binary @"$f" "${UPLOAD_BASE}?name=${enc}" >/dev/null
   echo "Enviado: $name"
 }
-
 upload_one reports/junit.xml
 upload_one build-info.txt
 for f in artifacts/*.tar; do upload_one "$f"; done
 '''
             } else {
-              // ===== WINDOWS: versão robusta (valida URL, URL-encode, remove asset duplicado) =====
+              // ===== WINDOWS: robusto com validação + URL-encode + remoção de duplicados =====
               powershell '''
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -445,7 +468,7 @@ if ($tarFiles) { foreach ($t in $tarFiles) { [void]$files.Add($t.FullName) } }
 $relId = $res.id
 $assetsUrl = "https://api.github.com/repos/$($Env:REPO_SLUG)/releases/$relId/assets"
 
-# 6) Upload com remoção prévia se houver duplicado
+# 6) Upload (remove duplicado se existir)
 foreach ($f in $files) {
   $name = [IO.Path]::GetFileName($f)
   $encoded = [System.Web.HttpUtility]::UrlEncode($name)
@@ -519,11 +542,15 @@ REPO="$(git config --get remote.origin.url || echo unknown)"
 BRANCH="$(git rev-parse --abbrev-ref HEAD || echo unknown)"
 RUNID="${BUILD_URL:-${JOB_NAME}#${BUILD_NUMBER}}"
 
+set +e
 docker run --rm -v "$PWD:/app" -w /app \
   -e SMTP_HOST="${SMTP_HOST}" -e SMTP_PORT="${SMTP_PORT}" \
   -e SMTP_USER="$SMTP_USER" -e SMTP_PASS="$SMTP_PASS" -e EMAIL_TO="$EMAIL_TO" \
   python:3.13-slim python scripts/notify.py \
     --status "$STATUS" --run-id "$RUNID" --repo "$REPO" --branch "$BRANCH"
+RET=$?
+set -e
+[ $RET -eq 0 ] || echo "[warn] Notificação pós-build falhou (ignorado)."
 '''
           } else {
             powershell '''
@@ -548,7 +575,11 @@ $args = @(
   '--repo', $REPO,
   '--branch', $BRANCH
 )
-& docker @args
+try {
+  & docker @args
+} catch {
+  Write-Warning "Falha ao enviar email (ignorado): $($_.Exception.Message)"
+}
 '''
           }
         }
