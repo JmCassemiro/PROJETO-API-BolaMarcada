@@ -1,17 +1,23 @@
-# docker-compose.ci.yml
 services:
   db:
-    # no CI não publicar porta no host (usa rede interna do Compose)
+    # no CI não expõe porta no host
     ports: []
 
   api:
-    # desliga o env_file e injeta as variáveis vindas do Jenkins
+    # não leia .env no CI
     env_file: []
     environment:
       SECRET_KEY: ${SECRET_KEY}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES}
-      POSTGRES_SERVER: ${POSTGRES_SERVER}
-      POSTGRES_HOST: ${POSTGRES_SERVER}     # (caso seu app leia HOST em vez de SERVER)
+      POSTGRES_SERVER: db
+      POSTGRES_HOST: db
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+    # roda migração + testes e gera junit
+    command: ["/wait-for-it.sh","db:5432","--","sh","-lc","alembic upgrade head && pytest -q --junitxml=reports/junit.xml"]
+    # não precisa expor 8000 no CI
+    ports: []
+    # garante que o junit sobreviva ao down
+    volumes:
+      - ./reports:/app/reports

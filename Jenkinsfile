@@ -108,13 +108,16 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 echo "Usando: $compose_cmd"
 
+# Alguns projetos definem env_file: .env no compose base. Cria .env vazio p/ evitar erro no CI.
+[ -f .env ] || printf "# ci placeholder\n" > .env
+
 cleanup() { $compose_cmd -f docker-compose.yml -f docker-compose.ci.yml down -v || true; }
 trap cleanup EXIT
 
 $compose_cmd -f docker-compose.yml -f docker-compose.ci.yml up -d db
 
 # Normaliza CRLF sem sed -i (evita erro de rename no FS montado)
-$compose_cmd -f docker-compose.yml -f docker-compose.ci.yml run --rm api bash -lc 'tr -d "\\r" < scripts/run_tests.sh > /tmp/run_tests.sh && chmod +x /tmp/run_tests.sh && /tmp/run_tests.sh'
+$compose_cmd -f docker-compose.yml -f docker-compose.ci.yml run --rm api bash -lc 'tr -d "\r" < scripts/run_tests.sh > /tmp/run_tests.sh && chmod +x /tmp/run_tests.sh && /tmp/run_tests.sh'
 '''
           } else {
             powershell '''
@@ -126,6 +129,9 @@ $Env:COMPOSE_PROJECT_NAME = "fastapi-ci-$Env:BUILD_NUMBER"
 # Mapeia DB_USR/DB_PSW -> nomes esperados
 $Env:POSTGRES_USER     = $Env:DB_USR
 $Env:POSTGRES_PASSWORD = $Env:DB_PSW
+
+# Alguns projetos definem env_file: .env no compose base. Cria .env vazio p/ evitar erro no CI.
+if (!(Test-Path ".env")) { New-Item -ItemType File -Path ".env" | Out-Null }
 
 $dc  = Join-Path $Env:WORKSPACE 'docker-compose.yml'
 $ci  = Join-Path $Env:WORKSPACE 'docker-compose.ci.yml'
@@ -177,9 +183,9 @@ docker save -o artifacts/${IMAGE_NAME}_${IMAGE_TAG}.tar ${IMAGE_NAME}:${IMAGE_TA
                 powershell '''
 $ErrorActionPreference = "Stop"
 New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
-if ([string]::IsNullOrWhiteSpace($Env:IMAGE_TAG)) { $Env:IMAGE_TAG = "$($Env:BUILD_NUMBER)-local" }
-$tag = "$($Env:IMAGE_NAME):$($Env:IMAGE_TAG)"
-$archive = "artifacts/$($Env:IMAGE_NAME)_$($Env:IMAGE_TAG).tar"
+if ([string]::IsNullOrWhiteSpace($Env:IMAGE_TAG)) { $Env:IMAGE_TAG = "$(($Env:BUILD_NUMBER))-local" }
+$tag = "$(($Env:IMAGE_NAME)):$(($Env:IMAGE_TAG))"
+$archive = "artifacts/$(($Env:IMAGE_NAME))_$(($Env:IMAGE_TAG)).tar"
 docker build -t "$tag" -f Dockerfile .
 docker image ls "$tag"
 docker save -o "$archive" "$tag"
@@ -219,14 +225,14 @@ $REPO = git config --get remote.origin.url 2>$null; if ([string]::IsNullOrWhiteS
 $BRANCH = git rev-parse --abbrev-ref HEAD 2>$null; if ([string]::IsNullOrWhiteSpace($BRANCH)) { $BRANCH = 'unknown' }
 $RUNID = if ($Env:BUILD_URL) { $Env:BUILD_URL } else { "${JOB_NAME}#${BUILD_NUMBER}" }
 
-$volume = "$($Env:WORKSPACE):/app"
+$volume = "$(($Env:WORKSPACE)):/app"
 $args = @(
   'run','--rm','-v', $volume,'-w','/app',
-  '-e', "SMTP_HOST=$($Env:SMTP_HOST)",
-  '-e', "SMTP_PORT=$($Env:SMTP_PORT)",
-  '-e', "SMTP_USER=$($Env:SMTP_USER)",
-  '-e', "SMTP_PASS=$($Env:SMTP_PASS)",
-  '-e', "EMAIL_TO=$($Env:EMAIL_TO)",
+  '-e', "SMTP_HOST=$(($Env:SMTP_HOST))",
+  '-e', "SMTP_PORT=$(($Env:SMTP_PORT))",
+  '-e', "SMTP_USER=$(($Env:SMTP_USER))",
+  '-e', "SMTP_PASS=$(($Env:SMTP_PASS))",
+  '-e', "EMAIL_TO=$(($Env:EMAIL_TO))",
   'python:3.13-slim',
   'python','scripts/notify.py',
   '--status', $STATUS,
@@ -269,22 +275,22 @@ OWNER="${REPO_SLUG%%/*}"
 # login no GHCR para conseguir puxar ghcr.io/cli/cli
 echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GH_USER" --password-stdin
 
-# cria release (ou faz upload se já existir)
+# cria release (idempotente)
 docker run --rm -v "$PWD:/w" -w /w -e GH_TOKEN="$GITHUB_TOKEN" ghcr.io/cli/cli:latest \
-  release create "$TAG" reports/junit.xml build-info.txt \
+  release create "$TAG" \
   --repo "${REPO_SLUG}" \
   --title "Build ${BUILD_NUMBER} (${GIT_SHORT})" \
-  --notes "Artefatos do Jenkins. Imagem Docker: ghcr.io/${OWNER}/ci-api:${IMAGE_TAG}" \
-|| docker run --rm -v "$PWD:/w" -w /w -e GH_TOKEN="$GITHUB_TOKEN" ghcr.io/cli/cli:latest \
-  release upload "$TAG" reports/junit.xml build-info.txt --repo "${REPO_SLUG}" --clobber
+  --notes "Artefatos do Jenkins. Imagem Docker: ghcr.io/${OWNER}/ci-api:${IMAGE_TAG}" || true
 
-# envia também quaisquer tar gerados em artifacts/
-docker run --rm -v "$PWD:/w" -w /w \
-  -e GH_TOKEN="$GITHUB_TOKEN" -e TAG="$TAG" -e REPO_SLUG="$REPO_SLUG" \
-  ghcr.io/cli/cli:latest sh -lc 'set -- artifacts/*.tar; if [ -e "$1" ]; then gh release upload "$TAG" "$@" --repo "$REPO_SLUG" --clobber; fi'
+# envia apenas arquivos existentes
+for f in reports/junit.xml build-info.txt artifacts/*.tar; do
+  [ -e "$f" ] || continue
+  docker run --rm -v "$PWD:/w" -w /w -e GH_TOKEN="$GITHUB_TOKEN" ghcr.io/cli/cli:latest \
+    release upload "$TAG" "$f" --repo "${REPO_SLUG}" --clobber
+done
 '''
             } else {
-              // PowerShell: sem regex (evita '\{')
+              // Windows: usar gh CLI em container também (evita REST manual e erro de URI)
               powershell '''
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -303,62 +309,30 @@ $lines = @(
 )
 [IO.File]::WriteAllLines((Join-Path $Env:WORKSPACE 'build-info.txt'), $lines)
 
-$Headers = @{
-  Authorization = "Bearer $($Env:GITHUB_TOKEN)"
-  Accept        = "application/vnd.github+json"
-  "User-Agent"  = "jenkins-ci"
+# login para puxar ghcr.io/cli/cli
+$Env:GITHUB_TOKEN | docker login ghcr.io -u $Env:GH_USER --password-stdin | Out-Null
+
+$vol = "$($Env:WORKSPACE):/w"
+
+# cria release (idempotente)
+$createArgs = @('run','--rm','-v',$vol,'-w','/w','-e',"GH_TOKEN=$($Env:GITHUB_TOKEN)",
+               'ghcr.io/cli/cli:latest','gh','release','create',$TAG,
+               '--repo',$Env:REPO_SLUG,'--title',"Build $($Env:BUILD_NUMBER) ($($Env:GIT_SHORT))",
+               '--notes',"Artefatos do Jenkins. Imagem Docker: ghcr.io/$owner/ci-api:$($Env:IMAGE_TAG)")
+$null = & docker @createArgs; if ($LASTEXITCODE -ne 0) { Write-Host "Release já existe ou criado em paralelo, continuando..." }
+
+# montar lista de arquivos existentes
+$files = New-Object System.Collections.ArrayList
+foreach ($p in @('reports/junit.xml','build-info.txt')) {
+  if (Test-Path (Join-Path $Env:WORKSPACE $p)) { [void]$files.Add($p) }
 }
+$tarFiles = Get-ChildItem -Path (Join-Path $Env:WORKSPACE 'artifacts') -Filter *.tar -ErrorAction SilentlyContinue
+if ($tarFiles) { foreach ($t in $tarFiles) { $rel = $t.FullName.Replace($Env:WORKSPACE,'').Replace('\\','/').TrimStart('/'); [void]$files.Add($rel) } }
 
-# cria ou obtém release
-$body = @{
-  tag_name   = $TAG
-  name       = "Build $($Env:BUILD_NUMBER) ($($Env:GIT_SHORT))"
-  body       = "Artefatos do Jenkins. Imagem Docker: ghcr.io/$owner/ci-api:$($Env:IMAGE_TAG)"
-  draft      = $false
-  prerelease = $false
-} | ConvertTo-Json
-
-try {
-  $res = Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$($Env:REPO_SLUG)/releases" -Headers $Headers -ContentType 'application/json' -Body $body
-} catch {
-  if ($_.Exception.Response.StatusCode.Value__ -eq 422) {
-    $res = Invoke-RestMethod -Method Get -Uri "https://api.github.com/repos/$($Env:REPO_SLUG)/releases/tags/$TAG" -Headers $Headers
-  } else { throw }
-}
-
-# Upload URL sem regex
-$uploadBase = $null
-if ($res.upload_url) {
-  $uploadBase = $res.upload_url.Split('{')[0]
-} elseif ($res.assets_url) {
-  $uploadBase = $res.assets_url.Replace('https://api.github.com','https://uploads.github.com')
-} else {
-  throw "GitHub release response sem upload_url/assets_url: $( $res | ConvertTo-Json -Depth 5 )"
-}
-
-if ([string]::IsNullOrWhiteSpace($uploadBase) -or -not $uploadBase.StartsWith('https://')) {
-  throw "uploadBase inválido: '$uploadBase'"
-}
-
-Write-Host "Upload base: $uploadBase"
-
-# arquivos para enviar
-$files = @("reports/junit.xml","build-info.txt")
-$tarFiles = Get-ChildItem -Path "artifacts" -Filter *.tar -ErrorAction SilentlyContinue
-if ($tarFiles) { $files += $tarFiles.FullName }
-
-foreach ($f in $files) {
-  if (Test-Path $f) {
-    $name = [IO.Path]::GetFileName($f)
-    $encoded = [uri]::EscapeDataString($name)
-    $uri = "$uploadBase?name=$encoded"
-    Invoke-RestMethod -Method Post -Uri $uri `
-      -Headers @{ Authorization = $Headers.Authorization; "Content-Type" = "application/octet-stream"; "User-Agent" = "jenkins-ci" } `
-      -InFile $f | Out-Null
-    Write-Host "Enviado: $name"
-  } else {
-    Write-Warning "Arquivo não encontrado: $f"
-  }
+foreach ($rel in $files) {
+  $uploadArgs = @('run','--rm','-v',$vol,'-w','/w','-e',"GH_TOKEN=$($Env:GITHUB_TOKEN)",
+                  'ghcr.io/cli/cli:latest','gh','release','upload',$TAG,$rel,'--repo',$Env:REPO_SLUG,'--clobber')
+  & docker @uploadArgs
 }
 '''
             }
@@ -382,8 +356,8 @@ docker push "$TARGET"
 $ErrorActionPreference = "Stop"
 $OWNER = $Env:REPO_SLUG.Split('/')[0]
 $TARGET = "ghcr.io/$OWNER/ci-api:$($Env:IMAGE_TAG)"
-$Env:GHCR_TOKEN | docker login ghcr.io -u $Env:GHCR_USER --password-stdin
-docker tag "$($Env:IMAGE_NAME):$($Env:IMAGE_TAG)" $TARGET
+$Env:GHCR_TOKEN | docker login ghcr.io -u $Env:GHCR_USER --password-stdin | Out-Null
+docker tag "$(($Env:IMAGE_NAME)):$(($Env:IMAGE_TAG))" $TARGET
 docker push $TARGET
 '''
             }
@@ -425,14 +399,14 @@ $REPO = git config --get remote.origin.url 2>$null; if ([string]::IsNullOrWhiteS
 $BRANCH = git rev-parse --abbrev-ref HEAD 2>$null; if ([string]::IsNullOrWhiteSpace($BRANCH)) { $BRANCH = 'unknown' }
 $RUNID = if ($Env:BUILD_URL) { $Env:BUILD_URL } else { "${JOB_NAME}#${BUILD_NUMBER}" }
 
-$volume = "$($Env:WORKSPACE):/app"
+$volume = "$(($Env:WORKSPACE)):/app"
 $args = @(
   'run','--rm','-v', $volume,'-w','/app',
-  '-e', "SMTP_HOST=$($Env:SMTP_HOST)",
-  '-e', "SMTP_PORT=$($Env:SMTP_PORT)",
-  '-e', "SMTP_USER=$($Env:SMTP_USER)",
-  '-e', "SMTP_PASS=$($Env:SMTP_PASS)",
-  '-e', "EMAIL_TO=$($Env:EMAIL_TO)",
+  '-e', "SMTP_HOST=$(($Env:SMTP_HOST))",
+  '-e', "SMTP_PORT=$(($Env:SMTP_PORT))",
+  '-e', "SMTP_USER=$(($Env:SMTP_USER))",
+  '-e', "SMTP_PASS=$(($Env:SMTP_PASS))",
+  '-e', "EMAIL_TO=$(($Env:EMAIL_TO))",
   'python:3.13-slim',
   'python','scripts/notify.py',
   '--status', $STATUS,
