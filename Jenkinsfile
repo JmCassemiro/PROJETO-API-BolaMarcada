@@ -168,7 +168,6 @@ finally {
       }
     }
 
-    // ====== Paralelo exigido (Empacotamento + Notificação) ======
     stage('Paralelo: Empacotamento + Notificação') {
       parallel {
         stage('Empacotamento (Docker)') {
@@ -259,7 +258,6 @@ $args = @(
       steps {
         script { env.CI_STATUS = env.CI_STATUS ?: (currentBuild.currentResult ?: 'IN_PROGRESS') }
 
-        // 1) Release com junit.xml + build-info.txt (+ artifacts/*.tar se existir)
         withCredentials([usernamePassword(credentialsId: 'github-pat', usernameVariable: 'GH_USER', passwordVariable: 'GH_PAT')]) {
           script {
             if (isUnix()) {
@@ -280,7 +278,7 @@ API="https://api.github.com/repos/${REPO_SLUG}/releases"
 AUTH="Authorization: Bearer ${GH_PAT}"
 UA="User-Agent: jenkins-ci"
 
-# Cria a release (se já existir, pega pela tag)
+# Tenta criar a release; se já existir, busca por tag
 CREATE_PAYLOAD=$(cat <<JSON
 {"tag_name":"${TAG}","name":"Build ${BUILD_NUMBER} (${GIT_SHORT})",
  "body":"Artefatos do Jenkins. Imagem Docker (.tar) anexada.",
@@ -289,28 +287,34 @@ JSON
 )
 
 set +e
-RES=$(curl -sfSL -H "$AUTH" -H "Accept: application/vnd.github+json" -H "$UA" \
-  -X POST -d "$CREATE_PAYLOAD" "$API")
+curl -sfSL -H "$AUTH" -H "Accept: application/vnd.github+json" -H "$UA" -X POST -d "$CREATE_PAYLOAD" "$API" > release.json
 RC=$?
 set -e
 
-if [ $RC -ne 0 ] || [ "$(printf '%s' "$RES" | tr -d '\\n' | grep -c '"upload_url"')" -eq 0 ]; then
-  RES=$(curl -sfSL -H "$AUTH" -H "Accept: application/vnd.github+json" -H "$UA" \
-    "$API/tags/${TAG}")
+if [ $RC -ne 0 ] || ! grep -q '"upload_url"' release.json; then
+  curl -sfSL -H "$AUTH" -H "Accept: application/vnd.github+json" -H "$UA" "$API/tags/${TAG}" > release.json
 fi
 
-# <<< FIX: usar ERE no sed (evita \(\))
-UPLOAD_BASE=$(printf '%s' "$RES" | sed -E -n 's/.*"upload_url"[[:space:]]*:[[:space:]]*"([^"]*)".*/\\1/p' | sed 's/{.*}//')
+# Extrai upload_url com Python (sem sed/jq)
+UPLOAD_BASE=$(docker run --rm -v "$PWD:/w" -w /w python:3.13-slim python - <<'PY'
+import json
+with open('release.json','r',encoding='utf-8') as f:
+    data = json.load(f)
+upload = data.get('upload_url') or (data.get('assets_url','').replace('https://api.github.com','https://uploads.github.com'))
+print(upload.split('{')[0])
+PY
+)
+
 if [ -z "$UPLOAD_BASE" ]; then
   echo "Falha ao obter upload_url da release:"
-  echo "$RES"
+  cat release.json
   exit 1
 fi
 
 upload() {
-  local f="$1"
+  f="$1"
   [ -e "$f" ] || { echo "WARN: arquivo ausente: $f"; return 0; }
-  local name; name=$(basename "$f")
+  name=$(basename "$f")
   curl -sfSL -H "$AUTH" -H "$UA" -H "Content-Type: application/octet-stream" \
     --data-binary @"$f" "${UPLOAD_BASE}?name=${name}" >/dev/null
   echo "Enviado: $name"
@@ -321,7 +325,6 @@ upload build-info.txt
 for f in artifacts/*.tar; do upload "$f"; done
 '''
             } else {
-              // Windows: API REST nativa (sem gh CLI/containers)
               powershell '''
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -332,7 +335,7 @@ $api   = "https://api.github.com/repos/$($Env:REPO_SLUG)/releases"
 
 # build-info.txt
 $lines = @(
-  "status=$($Env:CI_STATUS))",
+  "status=$($Env:CI_STATUS)",
   "image=$($Env:IMAGE_NAME):$($Env:IMAGE_TAG)",
   "repo=$($Env:REPO_SLUG)",
   "commit=$($Env:GIT_SHORT)",
@@ -426,7 +429,6 @@ docker push $TARGET
 
   post {
     always {
-      // status final disponível para shells
       script { env.CI_STATUS = currentBuild.currentResult ?: 'UNKNOWN' }
 
       withCredentials([
@@ -477,7 +479,6 @@ $args = @(
         }
       }
 
-      // limpeza do docker
       script {
         if (isUnix()) {
           sh 'docker system prune -f || true'
