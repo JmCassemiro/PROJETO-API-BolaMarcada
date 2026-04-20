@@ -105,3 +105,4 @@ def test_delete_field_not_found():
     data = response.json()
     # Corrigido: remove o ponto final
     assert data["detail"] == "Campo não encontrado"
+    

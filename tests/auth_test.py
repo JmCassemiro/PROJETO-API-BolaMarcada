@@ -95,7 +95,7 @@ def test_authenticate_valid_password(mock_verify):
     assert user.email == "teste@example.com"
 
 
-# Teste 3: create & decode access token
+# Teste 4: create & decode access token
 def test_create_and_decode_access_token():
     from utils.security import create_access_token, decode_access_token
 
@@ -105,7 +105,7 @@ def test_create_and_decode_access_token():
     assert decoded == str(user_id)
 
 
-# Teste 4: rota /token integração
+# Teste 5: rota /token integração
 def test_token_route_integration(client, db_session):
     from models.models import User
     from utils.security import get_password_hash, decode_access_token
@@ -138,7 +138,7 @@ def test_token_route_integration(client, db_session):
     assert decoded == str(user.id) or decoded.get("sub") == str(user.id)
 
 
-# Teste 5: rota /users/me integração
+# Teste 6: rota /users/me integração
 def test_update_me_route_success():
     client = make_client()
 
@@ -173,7 +173,7 @@ def test_update_me_route_success():
         assert len(args) == 3
         assert getattr(args[1], "email", None) == "auth@example.com"
 
-# Teste 6: rota DELETE /users/me integração (soft delete padrão)
+# Teste 7: rota DELETE /users/me integração (soft delete padrão)
 def test_delete_me_route_soft_default_204():
     client = make_client()
 
